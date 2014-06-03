@@ -19,9 +19,12 @@
 import json
 import time
 import urllib
+import os.path
 
 from tempest.common.rest_client import RestClient
 from tempest.common import waiters
+from tempest.services.network.json.network_client import NetworkClientJSON
+from tempest.services.identity.json.identity_client import TokenClientJSON
 from tempest import exceptions
 
 
@@ -33,6 +36,28 @@ class ServersClientJSON(RestClient):
                                                 auth_url, tenant_name,
                                                 auth_version=auth_version)
         self.service = self.config.compute.catalog_type
+
+    def get_network_id(self):
+        creds = (self.config, self.user, self.password,
+                 self.auth_url, self.tenant_name)
+
+        network_client = NetworkClientJSON(*creds)
+        token_client = TokenClientJSON(self.config)
+
+        _, token = token_client.auth(self.user, self.password,
+                                     self.tenant_name)
+        tenant_id = json.loads(token)['access']['token']['tenant']['id']
+
+        _, networks = network_client.list_networks()
+        networks = networks["networks"]
+        networks = [net for net in networks
+                    if not net.get("router:external")
+                    and net.get("tenant_id") == tenant_id]
+
+        if len(networks) < 1:
+            raise exceptions.NotFound()
+
+        return networks[0]["id"]
 
     def create_server(self, name, image_ref, flavor_ref, **kwargs):
         """
@@ -63,12 +88,15 @@ class ServersClientJSON(RestClient):
             'flavorRef': flavor_ref
         }
 
+        if "networks" not in kwargs and self.config.service_available.neutron:
+            kwargs["networks"] = [{"uuid": self.get_network_id()}]
+
         for option in ['personality', 'adminPass', 'key_name',
                        'security_groups', 'networks', 'user_data',
                        'availability_zone', 'accessIPv4', 'accessIPv6',
                        'min_count', 'max_count', ('metadata', 'meta'),
                        ('OS-DCF:diskConfig', 'disk_config'),
-                       'return_reservation_id']:
+                       'return_reservation_id', 'config_drive']:
             if isinstance(option, tuple):
                 post_param = option[0]
                 key = option[1]
@@ -78,9 +106,15 @@ class ServersClientJSON(RestClient):
             value = kwargs.get(key)
             if value is not None:
                 post_body[post_param] = value
-        post_body = json.dumps({'server': post_body})
-        resp, body = self.post('servers', post_body, self.headers)
 
+        res = {'server': post_body}
+
+        for option in ("os:scheduler_hints",):
+            if option in kwargs:
+                res[option] = kwargs[option]
+
+        post_body = json.dumps(res)
+        resp, body = self.post('servers', post_body, self.headers)
         body = json.loads(body)
         # NOTE(maurosr): this deals with the case of multiple server create
         # with return reservation id set True
@@ -151,9 +185,10 @@ class ServersClientJSON(RestClient):
         body = json.loads(body)
         return resp, body
 
-    def wait_for_server_status(self, server_id, status):
+    def wait_for_server_status(self, server_id, status, ready_wait=True):
         """Waits for a server to reach a given status."""
-        return waiters.wait_for_server_status(self, server_id, status)
+        return waiters.wait_for_server_status(self, server_id, status,
+                                              ready_wait)
 
     def wait_for_server_termination(self, server_id, ignore_error=False):
         """Waits for server to reach termination."""
@@ -312,6 +347,22 @@ class ServersClientJSON(RestClient):
         }
 
         req_body = json.dumps({'os-migrateLive': migrate_params})
+
+        resp, body = self.post("servers/%s/action" % str(server_id),
+                               req_body, self.headers)
+        return resp, body
+
+    def forcemove_server(self, server_id, **kwargs):
+        """This should be called with administrator privileges ."""
+
+        forcemove_params = dict(
+            disk_over_commit=kwargs.get('disk_over_commit', False),
+            block_migration=kwargs.get('block_migration', False),
+            ignore_broken_dependencies=kwargs.get('ignore_broken_dependencies',
+                                                  False),
+            ignore_hints=kwargs.get('ignore_hints', False))
+
+        req_body = json.dumps({'forcemove': forcemove_params})
 
         resp, body = self.post("servers/%s/action" % str(server_id),
                                req_body, self.headers)
